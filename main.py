@@ -4,10 +4,36 @@ import json
 import ssl
 from datetime import datetime, timezone
 
+# --- Zone Configuration ---
+# Main Bounding Box limits
+LAT_MIN, LAT_MAX = 42.57846, 42.71884
+LON_MIN, LON_MAX = -82.562256, -82.42218
+
+# Calculate height of each zone
+TOTAL_LAT_SPAN = LAT_MAX - LAT_MIN
+ZONE_HEIGHT = TOTAL_LAT_SPAN / 11
+
+def get_zone_number(latitude):
+    """
+    Determines the zone number (1-11) based on latitude.
+    Zone 1 is the highest (northernmost), Zone 11 is the lowest (southernmost).
+    """
+    if not (LAT_MIN <= latitude <= LAT_MAX):
+        return None # Outside the bounding box boundaries
+    
+    # Calculate how far down from the maximum latitude the ship is
+    distance_from_top = LAT_MAX - latitude
+    
+    # Floor division determines the zone index (0 to 10)
+    zone_index = int(distance_from_top // ZONE_HEIGHT)
+    
+    # Edge case: If latitude is exactly LAT_MIN, it might evaluate to index 11
+    zone_number = min(zone_index + 1, 11)
+    return zone_number
+
 async def connect_ais_stream():
     uri = "wss://stream.aisstream.io/v0/stream"
     
-    # Create an explicit SSL context to prevent handshake delays
     ssl_context = ssl.create_default_context()
     ssl_context.check_hostname = False
     ssl_context.verify_mode = ssl.CERT_NONE
@@ -16,23 +42,18 @@ async def connect_ais_stream():
     
     try:
         async with websockets.connect(uri, ssl=ssl_context) as websocket:
-            # AISStream API requires: [[LatitudeStart, LongitudeStart], [LatitudeEnd, LongitudeEnd]]
-            # Extracted from your areaPolygon data:
-            # Latitudes: 42.57846 to 42.71884
-            # Longitudes: -82.562256 to -82.42218
-            st_clair_river_bbox = [[42.57846, -82.562256], [42.71884, -82.42218]]
+            st_clair_river_bbox = [[LAT_MIN, LON_MIN], [LAT_MAX, LON_MAX]]
 
-            # Construct a fully compliant subscription payload with your specific bounds
+            # Subscribe to PositionReport for live tracking
             subscribe_message = {
                 "APIKey": "",
                 "BoundingBoxes": [st_clair_river_bbox], 
-                "FilterMessageTypes": ["PositionReport"]
+                "FilterMessageTypes": ["PositionReport"] 
             }
 
-            # Send instantly to beat the 3-second server timeout rule
             await websocket.send(json.dumps(subscribe_message))
-            print(f"[{datetime.now(timezone.utc)}] Subscription sent successfully for St. Clair River delta region.")
-            print(f"[{datetime.now(timezone.utc)}] Awaiting data stream...")
+            print(f"[{datetime.now(timezone.utc)}] Subscription sent for St. Clair River delta region.")
+            print(f"[{datetime.now(timezone.utc)}] Monitoring 11 designated Zones...")
 
             # Listen loop
             async for message_json in websocket:
@@ -40,16 +61,24 @@ async def connect_ais_stream():
                 message_type = message.get("MessageType")
 
                 if message_type == "PositionReport":
-                    ais_message = message['Message']['PositionReport']
-                    print(f"[{datetime.now(timezone.utc)}] TARGET FOUND! -> ShipID: {ais_message['UserID']} | Lat: {ais_message['Latitude']} | Lon: {ais_message['Longitude']}")
+                    # Extract Ship Name from Metadata wrapper
+                    metadata = message.get("MetaData", {})
+                    ship_name = metadata.get("ShipName", "UNKNOWN").strip()
                     
-                    # Because the AISStream backend filters the stream to only send ships inside your bounding box,
-                    # any PositionReport hitting this block is guaranteed to be within your specified area.
-                    # TODO: Trigger physical light/notification logic here.
+                    # Extract coordinates from the report
+                    position_report = message['Message']['PositionReport']
+                    latitude = position_report.get('Latitude')
                     
+                    if latitude:
+                        zone = get_zone_number(latitude)
+                        
+                        if zone:
+                            print(f"[{datetime.now(timezone.utc)}] {ship_name} is in Zone {zone}")
+                        else:
+                            print(f"[{datetime.now(timezone.utc)}] {ship_name} detected slightly outside zone boundaries (Lat: {latitude})")
+                            
                 else:
-                    # Print anything else the server sends back (like errors or metadata)
-                    print(f"[{datetime.now(timezone.utc)}] Received other message type: {message_type}")
+                    print(f"[{datetime.now(timezone.utc)}] Received message type: {message_type}")
 
     except Exception as e:
         print(f"Connection error occurred: {e}")
