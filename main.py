@@ -4,25 +4,40 @@ import json
 import ssl
 from datetime import datetime, timezone, timedelta
 
-# --- Zone Configuration ---
-LAT_MIN, LAT_MAX = 42.57846, 42.71884
+# --- Core Zone Configuration ---
+# The active tracking bounds
+TRACKING_LAT_MIN, TRACKING_LAT_MAX = 42.57846, 42.71884
 LON_MIN, LON_MAX = -82.562256, -82.42218
 
-TOTAL_LAT_SPAN = LAT_MAX - LAT_MIN
+TOTAL_LAT_SPAN = TRACKING_LAT_MAX - TRACKING_LAT_MIN
 ZONE_HEIGHT = TOTAL_LAT_SPAN / 11
+
+# --- Expanded Exit Box Configuration ---
+# Broaden the latitude search box by ~0.02 degrees North and South to capture exits
+AIS_LAT_MIN = TRACKING_LAT_MIN - 0.02 
+AIS_LAT_MAX = TRACKING_LAT_MAX + 0.02
 
 def get_zone_number(latitude):
     """
-    Determines the zone number (1-11) based on latitude.
-    Zone 1 is the northernmost, Zone 11 is the southernmost.
+    Determines the zone number (1-11) or returns an Exit Box designator.
+    Zone 1 is northernmost, Zone 11 is southernmost.
     """
-    if not (LAT_MIN <= latitude <= LAT_MAX):
-        return None 
-    
-    distance_from_top = LAT_MAX - latitude
-    zone_index = int(distance_from_top // ZONE_HEIGHT)
-    zone_number = min(zone_index + 1, 11)
-    return zone_number
+    # 1. Check Northern Exit Box
+    if TRACKING_LAT_MAX < latitude <= AIS_LAT_MAX:
+        return "EXIT_NORTH"
+        
+    # 2. Check Southern Exit Box
+    if AIS_LAT_MIN <= latitude < TRACKING_LAT_MIN:
+        return "EXIT_SOUTH"
+        
+    # 3. Check Standard Tracking Zones
+    if TRACKING_LAT_MIN <= latitude <= TRACKING_LAT_MAX:
+        distance_from_top = TRACKING_LAT_MAX - latitude
+        zone_index = int(distance_from_top // ZONE_HEIGHT)
+        zone_number = min(zone_index + 1, 11)
+        return zone_number
+        
+    return None 
 
 def get_direction(cog):
     """
@@ -30,8 +45,6 @@ def get_direction(cog):
     """
     if cog is None:
         return "Unknown"
-    # COG is 0-360. 0/360 is true North. 
-    # Broadly: 270 to 90 degrees is Northbound, 90 to 270 is Southbound
     if 90 < cog <= 270:
         return "South"
     return "North"
@@ -42,22 +55,34 @@ class RiverTracker:
     Manages a persistent, shared model of the river zones.
     """
     def __init__(self):
-        # Initialize zones 1 through 11 with empty tracking dicts
         self.zones = {i: {} for i in range(1, 12)}
         self.lock = asyncio.Lock()
+
+    async def remove_ship(self, mmsi, name, exit_reason):
+        """
+        Instantly clears a ship from all tracking zones when it leaves the river perimeter.
+        """
+        async with self.lock:
+            now = datetime.now(timezone.utc)
+            removed = False
+            for z_idx, ships in self.zones.items():
+                if mmsi in ships:
+                    del ships[mmsi]
+                    print(f"[{now}] {name} (MMSI: {mmsi}) REMOVED via {exit_reason}.")
+                    removed = True
+            return removed
 
     async def update_ship(self, mmsi, name, zone_num, direction):
         async with self.lock:
             now = datetime.now(timezone.utc)
             
-            # 1. Enforce that a ship only ever exists in ONE zone.
-            # Remove this MMSI if it currently resides in any other zone
+            # Enforce that a ship only ever exists in ONE zone.
             for z_idx, ships in self.zones.items():
                 if mmsi in ships and z_idx != zone_num:
                     del ships[mmsi]
                     print(f"[{now}] {name} (MMSI: {mmsi}) moved out of Zone {z_idx}")
 
-            # 2. Add or update the ship data in the correct zone
+            # Add or update the ship data in the correct zone
             is_new = mmsi not in self.zones[zone_num]
             self.zones[zone_num][mmsi] = {
                 "name": name,
@@ -73,13 +98,12 @@ class RiverTracker:
         Background worker that evicts ships missing updates for over `ttl_minutes`.
         """
         while True:
-            await asyncio.sleep(10) # Check every 10 seconds
+            await asyncio.sleep(10) 
             async with self.lock:
                 now = datetime.now(timezone.utc)
                 cutoff = now - timedelta(minutes=ttl_minutes)
                 
                 for zone_num, ships in self.zones.items():
-                    # Find all MMSIs matching eviction criteria
                     stale_mmsis = [
                         mmsi for mmsi, data in ships.items() 
                         if data["last_updated"] < cutoff
@@ -89,16 +113,6 @@ class RiverTracker:
                         ship_name = ships[mmsi]["name"]
                         del ships[mmsi]
                         print(f"[{now}] REMOVED stale ship: {ship_name} (MMSI: {mmsi}) from Zone {zone_num} due to inactivity.")
-
-    def print_state(self):
-        """Optional debugging helper to see what's currently in memory"""
-        print("\n--- Current River State ---")
-        for zone_num, ships in self.zones.items():
-            if ships:
-                print(f"Zone {zone_num}:")
-                for mmsi, data in ships.items():
-                    print(f"  - [{data['direction']}] {data['name']} (MMSI: {mmsi}) - Last updated: {data['last_updated'].strftime('%H:%M:%S')}")
-        print("---------------------------\n")
 
 
 async def connect_ais_stream(tracker: RiverTracker):
@@ -112,7 +126,8 @@ async def connect_ais_stream(tracker: RiverTracker):
     
     try:
         async with websockets.connect(uri, ssl=ssl_context) as websocket:
-            st_clair_river_bbox = [[LAT_MIN, LON_MIN], [LAT_MAX, LON_MAX]]
+            # Note: Using the expanded AIS limits here to catch ships entering exit boxes
+            st_clair_river_bbox = [[AIS_LAT_MIN, LON_MIN], [AIS_LAT_MAX, LON_MAX]]
 
             subscribe_message = {
                 "APIKey": "",
@@ -121,7 +136,7 @@ async def connect_ais_stream(tracker: RiverTracker):
             }
 
             await websocket.send(json.dumps(subscribe_message))
-            print(f"[{datetime.now(timezone.utc)}] Subscription sent for St. Clair River delta region.")
+            print(f"[{datetime.now(timezone.utc)}] Subscription sent for St. Clair River.")
 
             async for message_json in websocket:
                 message = json.loads(message_json)
@@ -134,33 +149,30 @@ async def connect_ais_stream(tracker: RiverTracker):
                     
                     position_report = message['Message']['PositionReport']
                     latitude = position_report.get('Latitude')
-                    cog = position_report.get('Cog') # Course over ground
+                    cog = position_report.get('Cog')
                     
                     if latitude and mmsi:
                         zone = get_zone_number(latitude)
-                        if zone:
+                        
+                        if zone in ["EXIT_NORTH", "EXIT_SOUTH"]:
+                            # Instantly drop the ship from tracking without waiting for TTL timeout
+                            await tracker.remove_ship(mmsi, ship_name, exit_reason=zone)
+                        elif zone:
                             direction = get_direction(cog)
-                            # Update our persistent shared object
                             await tracker.update_ship(mmsi, ship_name, zone, direction)
-                        else:
-                            pass # Ignored outside bounding box boundaries
                             
                 elif message_type == "Ping":
-                    # Keepalive message handling if necessary
                     pass
 
     except Exception as e:
         print(f"Connection error occurred: {e}")
 
 async def main():
-    # Instantiate the shared tracker object
     tracker = RiverTracker()
-    
-    # Run the stream listener and the eviction loop concurrently
     await asyncio.gather(
         connect_ais_stream(tracker),
-        tracker.cleanup_stale_ships(ttl_minutes=5)
+        tracker.cleanup_stale_ships(ttl_minutes=10)
     )
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    async_instance = asyncio.run(main())
