@@ -122,50 +122,69 @@ async def connect_ais_stream(tracker: RiverTracker):
     ssl_context.check_hostname = False
     ssl_context.verify_mode = ssl.CERT_NONE
 
-    print(f"[{datetime.now(timezone.utc)}] Connecting to AISStream...")
+    retry_delay = 5  # Start with a 5-second delay on reconnect
     
-    try:
-        async with websockets.connect(uri, ssl=ssl_context) as websocket:
-            # Note: Using the expanded AIS limits here to catch ships entering exit boxes
-            st_clair_river_bbox = [[AIS_LAT_MIN, LON_MIN], [AIS_LAT_MAX, LON_MAX]]
+    while True:
+        try:
+            print(f"[{datetime.now(timezone.utc)}] Attempting to connect to AISStream...")
+            
+            # ping_interval=20: Sends a ping every 20 seconds
+            # ping_timeout=20: If no pong back within 20 seconds, considers the connection dead
+            async with websockets.connect(
+                uri, 
+                ssl=ssl_context, 
+                ping_interval=20, 
+                ping_timeout=20
+            ) as websocket:
+                
+                print(f"[{datetime.now(timezone.utc)}] Connected! Resetting retry delay.")
+                retry_delay = 5  # Reset delay upon successful connection
+                
+                st_clair_river_bbox = [[AIS_LAT_MIN, LON_MIN], [AIS_LAT_MAX, LON_MAX]]
+                subscribe_message = {
+                    "APIKey": "",
+                    "BoundingBoxes": [st_clair_river_bbox], 
+                    "FilterMessageTypes": ["PositionReport"] 
+                }
 
-            subscribe_message = {
-                "APIKey": "",
-                "BoundingBoxes": [st_clair_river_bbox], 
-                "FilterMessageTypes": ["PositionReport"] 
-            }
+                await websocket.send(json.dumps(subscribe_message))
+                print(f"[{datetime.now(timezone.utc)}] Subscription sent.")
 
-            await websocket.send(json.dumps(subscribe_message))
-            print(f"[{datetime.now(timezone.utc)}] Subscription sent for St. Clair River.")
+                # This loop will run smoothly as long as the connection stays active
+                async_instance = None
+                async for message_json in websocket:
+                    message = json.loads(message_json)
+                    message_type = message.get("MessageType")
 
-            async for message_json in websocket:
-                message = json.loads(message_json)
-                message_type = message.get("MessageType")
-
-                if message_type == "PositionReport":
-                    metadata = message.get("MetaData", {})
-                    ship_name = metadata.get("ShipName", "UNKNOWN").strip()
-                    mmsi = metadata.get("MMSI")
-                    
-                    position_report = message['Message']['PositionReport']
-                    latitude = position_report.get('Latitude')
-                    cog = position_report.get('Cog')
-                    
-                    if latitude and mmsi:
-                        zone = get_zone_number(latitude)
+                    if message_type == "PositionReport":
+                        metadata = message.get("MetaData", {})
+                        ship_name = metadata.get("ShipName", "UNKNOWN").strip()
+                        mmsi = metadata.get("MMSI")
                         
-                        if zone in ["EXIT_NORTH", "EXIT_SOUTH"]:
-                            # Instantly drop the ship from tracking without waiting for TTL timeout
-                            await tracker.remove_ship(mmsi, ship_name, exit_reason=zone)
-                        elif zone:
-                            direction = get_direction(cog)
-                            await tracker.update_ship(mmsi, ship_name, zone, direction)
+                        position_report = message['Message']['PositionReport']
+                        latitude = position_report.get('Latitude')
+                        cog = position_report.get('Cog')
+                        
+                        if latitude and mmsi:
+                            zone = get_zone_number(latitude)
                             
-                elif message_type == "Ping":
-                    pass
+                            if zone in ["EXIT_NORTH", "EXIT_SOUTH"]:
+                                await tracker.remove_ship(mmsi, ship_name, exit_reason=zone)
+                            elif zone:
+                                direction = get_direction(cog)
+                                await tracker.update_ship(mmsi, ship_name, zone, direction)
 
-    except Exception as e:
-        print(f"Connection error occurred: {e}")
+        except (websockets.exceptions.ConnectionClosed, ssl.SSLError, OSError) as e:
+            # Catch known network-level drop events
+            print(f"[{datetime.now(timezone.utc)}] Connection lost/dropped: {e}")
+        except Exception as e:
+            # Catch any unexpected code exceptions so the loop doesn't break
+            print(f"[{datetime.now(timezone.utc)}] Unexpected error occurred: {e}")
+        
+        # Reconnection Backoff logic
+        print(f"[{datetime.now(timezone.utc)}] Retrying connection in {retry_delay} seconds...")
+        await asyncio.sleep(retry_delay)
+        retry_delay = min(retry_delay * 2, 60)  # Exponential backoff, cap at 60 seconds
 
 async def main():
     tracker = RiverTracker()
