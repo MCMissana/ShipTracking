@@ -65,7 +65,7 @@ class RiverTracker:
 
     async def remove_ship(self, mmsi, name, exit_reason):
         """
-        Instantly clears a ship from all tracking zones when it leaves the river perimeter.
+        Instantly clears a ship from all tracking zones when it leaves the river perimeter or docks.
         """
         async with self.lock:
             now = datetime.now(timezone.utc)
@@ -79,23 +79,39 @@ class RiverTracker:
 
     async def update_ship(self, mmsi, name, zone_num, direction, current_lat, sog):
         """
-        Updates ship data when a live API message is received.
+        Updates ship data when a live API message is received, calculating simulation offset.
         """
         async with self.lock:
             now = datetime.now(timezone.utc)
             
-            # Enforce that a ship only ever exists in ONE zone.
+            # Look for existing tracking instance to calculate offset before we update state
+            existing_ship_data = None
             for z_idx, ships in self.zones.items():
-                if mmsi in ships and z_idx != zone_num:
-                    del ships[mmsi]
-                    print(f"[{now}] {name} (MMSI: {mmsi}) moved out of Zone {z_idx}")
+                if mmsi in ships:
+                    existing_ship_data = ships[mmsi]
+                    if z_idx != zone_num:
+                        del ships[mmsi]
+                        print(f"[{now}] {name} (MMSI: {mmsi}) moved out of Zone {z_idx}")
+                    break
 
             # AIS stream fallback: 102.3 means speed unavailable.
-            # If unavailable or corrupt, default safely to 6.0 knots.
             valid_sog = sog if (sog is not None and sog < 102.2) else 6.0
 
+            if existing_ship_data:
+                # Calculate how far off our simulation was from reality
+                simulated_lat = existing_ship_data["latitude"]
+                lat_offset = current_lat - simulated_lat
+                
+                # Convert latitude degrees back to approx nautical miles (1 degree latitude ≈ 60 Nautical Miles)
+                nm_offset = lat_offset * 60.0
+                
+                print(f"[{now}] [OFFSET REPORT] {name} (MMSI: {mmsi}) "
+                      f"Simulated Lat: {simulated_lat:.5f} vs Real Lat: {current_lat:.5f}. "
+                      f"Offset: {lat_offset:+.5f}° ({nm_offset:+.4f} NM)")
+
+            is_new = existing_ship_data is None
+            
             # Add or update the ship data in the correct zone
-            is_new = mmsi not in self.zones[zone_num]
             self.zones[zone_num][mmsi] = {
                 "name": name,
                 "direction": direction,
@@ -103,7 +119,7 @@ class RiverTracker:
                 "sog": valid_sog,
                 "last_updated": now,
                 "last_real_api_update": now,  # Anchors the exact time of the last true API data
-                "is_dead_reckoning": False
+                "is_dead_reckoning": True     # Set to True because we always simulate moving forward
             }
             
             action = "entered" if is_new else "updated in"
@@ -111,8 +127,8 @@ class RiverTracker:
 
     async def process_dead_reckoning_and_cleanup(self, max_dead_reckon_minutes=110):
         """
-        Runs every 60 seconds. Mimics movement for ships missing updates using their last
-        known SOG speed, and clears them completely if they hit an exit zone or exceed timeout.
+        Runs every 60 seconds. Always simulates movement for ALL current tracked ships
+        using their last known SOG speed, and clears them completely if they hit an exit zone or timeout.
         """
         while True:
             await asyncio.sleep(60) 
@@ -120,7 +136,6 @@ class RiverTracker:
             async with self.lock:
                 now = datetime.now(timezone.utc)
                 api_cutoff = now - timedelta(minutes=max_dead_reckon_minutes)
-                live_cutoff = now - timedelta(minutes=4) # Start dead reckoning after 10 mins of silence
                 
                 ships_to_migrate = []  # format: (mmsi, old_zone, new_zone, data)
                 ships_to_delete = []   # format: (mmsi, zone, reason)
@@ -133,32 +148,26 @@ class RiverTracker:
                             ships_to_delete.append((mmsi, zone_num, f"Absolute Timeout ({max_dead_reckon_minutes}m)"))
                             continue
 
-                        # 2. Check if ship requires dead reckoning simulation
-                        if data["last_real_api_update"] < live_cutoff:
-                            if not data["is_dead_reckoning"]:
-                                print(f"[{now}] ALERT: Lost API for {data['name']}. Mimicking at {data['sog']} knots...")
-                                data["is_dead_reckoning"] = True
+                        # Math: Speed in knots / 3600 converts nautical miles/hr into degrees latitude/minute
+                        ship_lat_change_per_minute = data["sog"] / 3600.0
 
-                            # Math: Speed in knots / 3600 converts nautical miles/hr into degrees latitude/minute
-                            ship_lat_change_per_minute = data["sog"] / 3600.0
+                        # Always advance simulated latitude based on direction
+                        if data["direction"] == "North":
+                            data["latitude"] += ship_lat_change_per_minute
+                        elif data["direction"] == "South":
+                            data["latitude"] -= ship_lat_change_per_minute
+                        else:
+                            # Unknown heading: Cannot reliably calculate positioning path, hold position.
+                            continue
 
-                            # Advance simulated latitude based on direction
-                            if data["direction"] == "North":
-                                data["latitude"] += ship_lat_change_per_minute
-                            elif data["direction"] == "South":
-                                data["latitude"] -= ship_lat_change_per_minute
-                            else:
-                                # Unknown heading: Cannot reliably calculate positioning path, hold position.
-                                continue
+                        # Re-verify zone layout using the freshly simulated latitude coordinate
+                        new_zone = get_zone_number(data["latitude"])
+                        data["last_updated"] = now
 
-                            # Re-verify zone layout using the freshly simulated latitude coordinate
-                            new_zone = get_zone_number(data["latitude"])
-                            data["last_updated"] = now
-
-                            if new_zone in ["EXIT_NORTH", "EXIT_SOUTH", None]:
-                                ships_to_delete.append((mmsi, zone_num, f"Simulated exit via {new_zone}"))
-                            elif new_zone != zone_num:
-                                ships_to_migrate.append((mmsi, zone_num, new_zone, data))
+                        if new_zone in ["EXIT_NORTH", "EXIT_SOUTH", None]:
+                            ships_to_delete.append((mmsi, zone_num, f"Simulated exit via {new_zone}"))
+                        elif new_zone != zone_num:
+                            ships_to_migrate.append((mmsi, zone_num, new_zone, data))
 
                 # Process Zone Migrations
                 for mmsi, old_zone, new_zone, data in ships_to_migrate:
@@ -223,10 +232,13 @@ async def connect_ais_stream(tracker: RiverTracker):
                         sog = position_report.get('Sog')  # Pulling Speed Over Ground (knots)
                         
                         if latitude and mmsi:
-                            # Filter: Drop message early if the ship is stopped, anchored, or docked (< 3 knots)
-                            # Note: We still check if sog is not None; if it is None, we assume it's moving 
-                            # to avoid dropping valid active vessels with temporary telemetry gaps.
+                            # If the ship has slowed down below our threshold, remove it from the system entirely.
                             if sog is not None and sog < MIN_TRACKING_SPEED_KNOTS:
+                                await tracker.remove_ship(
+                                    mmsi, 
+                                    ship_name, 
+                                    exit_reason="Dropped below minimum tracking speed (likely docked/anchored)"
+                                )
                                 continue
                                 
                             zone = get_zone_number(latitude)
